@@ -1,12 +1,12 @@
 pragma solidity ^0.6.11;
 
-// imports 
-import "https://github.com/smartcontractkit/chainlink/blob/develop/contracts/src/v0.6/interfaces/LinkTokenInterface.sol";
-import "https://github.com/smartcontractkit/chainlink/blob/develop/contracts/src/v0.6/interfaces/AggregatorV3Interface.sol";
-import "https://github.com/OpenZeppelin/openzeppelin-contracts/blob/master/contracts/math/SafeMath.sol";
+// imports
+import "../interfaces/chainlink/LinkTokenInterface.sol";
+import "../interfaces/chainlink/AggregatorV3Interface.sol";
+import "OpenZeppelin/openzeppelin-contracts@3.0.0/contracts/math/SafeMath.sol";
+ 
 
-contract SimpleOption {
-    using SafeMath for uint;
+contract SimpleOptions {
     //Overflow safe operators
     using SafeMath for uint;
     //Pricefeed interfaces
@@ -48,6 +48,22 @@ contract SimpleOption {
         contractAddr = payable(address(this));
     }
 
+    //Returns the latest ETH price
+    function getEthPrice() public view returns (uint) {
+        (
+            uint80 roundID, 
+            int price,
+            uint startedAt,
+            uint timeStamp,
+            uint80 answeredInRound
+        ) = ethFeed.latestRoundData();
+        // If the round is not complete yet, timestamp is 0
+        require(timeStamp > 0, "Round not complete");
+        //Price should never be negative thus cast int to unit is ok
+        //Price is 8 decimal places and will require 1e10 correction later to 18 places
+        return uint(price);
+    }
+    
     //Returns the latest LINK price
     function getLinkPrice() public view returns (uint) {
         (
@@ -63,7 +79,13 @@ contract SimpleOption {
         //Price is 8 decimal places and will require 1e10 correction later to 18 places
         return uint(price);
     }
-
+    
+    //Updates prices to latest
+    function updatePrices() internal {
+        ethPrice = getEthPrice();
+        linkPrice = getLinkPrice();
+    }
+    
     //Allows user to write a covered call option
     //Takes which token, a strike price(USD per token w/18 decimal places), premium(same unit as token), expiration time(unix) and how many tokens the contract is for
     function writeOption(string memory token, uint strike, uint premium, uint expiry, uint tknAmt) public payable {
@@ -80,7 +102,25 @@ contract SimpleOption {
             linkOpts.push(option(strike, premium, expiry, tknAmt, false, false, linkOpts.length, latestCost, msg.sender, address(0)));
         }
     }
-
+    
+    //Allows option writer to cancel and get their funds back from an unpurchased option
+    function cancelOption(string memory token, uint ID) public payable {
+        bytes32 tokenHash = keccak256(abi.encodePacked(token));
+        require(tokenHash == ethHash || tokenHash == linkHash, "Only ETH and LINK tokens are supported");
+        if (tokenHash == ethHash) {
+            require(msg.sender == ethOpts[ID].writer, "You did not write this option");
+            //Must not have already been canceled or bought
+            require(!ethOpts[ID].canceled && ethOpts[ID].buyer == address(0), "This option cannot be canceled");
+            ethOpts[ID].writer.transfer(ethOpts[ID].amount);
+            ethOpts[ID].canceled = true;
+        } else {
+            require(msg.sender == linkOpts[ID].writer, "You did not write this option");
+            require(!linkOpts[ID].canceled && linkOpts[ID].buyer == address(0), "This option cannot be canceled");
+            require(LINK.transferFrom(address(this), linkOpts[ID].writer, linkOpts[ID].amount), "Incorrect amount of LINK sent");
+            linkOpts[ID].canceled = true;
+        }
+    }
+    
     //Purchase a call option, needs desired token, ID of option and payment
     function buyOption(string memory token, uint ID) public payable {
         bytes32 tokenHash = keccak256(abi.encodePacked(token));
@@ -100,7 +140,7 @@ contract SimpleOption {
             linkOpts[ID].buyer = msg.sender;
         }
     }
-
+    
     //Exercise your call option, needs desired token, ID of option and payment
     function exercise(string memory token, uint ID) public payable {
         //If not expired and not already exercised, allow option owner to exercise
@@ -139,26 +179,8 @@ contract SimpleOption {
             linkOpts[ID].exercised = true;
         }
     }
-
-    //Allows option writer to cancel and get their funds back from an unpurchased option
-    function cancelOption(string memory token, uint ID) public payable {
-        bytes32 tokenHash = keccak256(abi.encodePacked(token));
-        require(tokenHash == ethHash || tokenHash == linkHash, "Only ETH and LINK tokens are supported");
-        if (tokenHash == ethHash) {
-            require(msg.sender == ethOpts[ID].writer, "You did not write this option");
-            //Must not have already been canceled or bought
-            require(!ethOpts[ID].canceled && ethOpts[ID].buyer == address(0), "This option cannot be canceled");
-            ethOpts[ID].writer.transfer(ethOpts[ID].amount);
-            ethOpts[ID].canceled = true;
-        } else {
-            require(msg.sender == linkOpts[ID].writer, "You did not write this option");
-            require(!linkOpts[ID].canceled && linkOpts[ID].buyer == address(0), "This option cannot be canceled");
-            require(LINK.transferFrom(address(this), linkOpts[ID].writer, linkOpts[ID].amount), "Incorrect amount of LINK sent");
-            linkOpts[ID].canceled = true;
-        }
-    }
-
-//Allows writer to retrieve funds from an expired, non-exercised, non-canceled option
+    
+    //Allows writer to retrieve funds from an expired, non-exercised, non-canceled option
     function retrieveExpiredFunds(string memory token, uint ID) public payable {
         bytes32 tokenHash = keccak256(abi.encodePacked(token));
         require(tokenHash == ethHash || tokenHash == linkHash, "Only ETH and LINK tokens are supported");
@@ -174,6 +196,19 @@ contract SimpleOption {
             require(linkOpts[ID].expiry <= now && !linkOpts[ID].exercised && !linkOpts[ID].canceled, "This option is not eligible for withdraw");
             require(LINK.transferFrom(address(this), linkOpts[ID].writer, linkOpts[ID].amount), "Incorrect amount of LINK sent");
             linkOpts[ID].canceled = true;
+        }
+    }
+    
+    //This is a helper function to help the user see what the cost to exercise an option is currently before they do so
+    //Updates lastestCost member of option which is publicly viewable
+    function updateExerciseCost(string memory token, uint ID) public {
+        bytes32 tokenHash = keccak256(abi.encodePacked(token));
+        require(tokenHash == ethHash || tokenHash == linkHash, "Only ETH and LINK tokens are supported");
+        updatePrices();
+        if (tokenHash == ethHash) {
+            ethOpts[ID].latestCost = ethOpts[ID].strike.mul(ethOpts[ID].amount).div(ethPrice.mul(10**10));
+        } else {
+            linkOpts[ID].latestCost = linkOpts[ID].strike.mul(linkOpts[ID].amount).div(linkPrice.mul(10**10));
         }
     }
 }
